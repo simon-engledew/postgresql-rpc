@@ -1,0 +1,4 @@
+default_version = '1.0'
+module_pathname = '$libdir/rpc'
+relocatable = true
+comment = 'RPC client for PostgreSQL; send and receive JSON documents inside the database.'
