@@ -4,9 +4,11 @@
 #include <utils/guc.h>
 #include <utils/builtins.h>
 
+#include <string.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -19,15 +21,13 @@ void _PG_fini(void);
 
 
 /* Global variables */
-char * g_hostname;
-int g_port;
+char * g_path;
 int g_timeout;
 
 /* Startup */
 void _PG_init(void)
 {
-    DefineCustomStringVariable("rpc.hostname", "Hostname", NULL, &g_hostname, false, PGC_USERSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
-    DefineCustomIntVariable("rpc.port", "Port", NULL, &g_port, false, 1, 65535, PGC_USERSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+    DefineCustomStringVariable("rpc.path", "Hostname", NULL, &g_path, "/var/run/postgresql/rpc.sock", PGC_USERSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
     DefineCustomIntVariable("rpc.timeout", "Timeout (Seconds)", NULL, &g_timeout, 5, 0, 60, PGC_USERSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 }
 
@@ -78,14 +78,11 @@ Datum rpc_request(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(rpc_request);
 Datum rpc_request(PG_FUNCTION_ARGS)
 {
-    int flags;
-
-    char protoname[] = "tcp";
-    struct protoent *protoent;
     text * request_text;
     text * response_text;
     char * request;
     char * response;
+    char * error;
 
     struct timeval timeout;
 
@@ -96,24 +93,10 @@ Datum rpc_request(PG_FUNCTION_ARGS)
     uint32_t recv_netlen;
 
     int sockfd;
-    in_addr_t in_addr;
-    struct hostent *hostent;
-    struct sockaddr_in sockaddr_in;
-
-    fd_set w, x;
+    struct sockaddr_un addr;
 
     if (PG_ARGISNULL(0)) {
         elog(ERROR, "An JSON document must be provided");
-        PG_RETURN_NULL();
-    }
-
-    if (g_hostname == false) {
-        elog(ERROR, "rpc.hostname must be set");
-        PG_RETURN_NULL();
-    }
-
-    if (g_port == false) {
-        elog(ERROR, "rpc.port must be set");
         PG_RETURN_NULL();
     }
 
@@ -125,12 +108,7 @@ Datum rpc_request(PG_FUNCTION_ARGS)
 
     send_netlen = htonl(send_len);
 
-    protoent = getprotobyname(protoname);
-    if (protoent == NULL) {
-        PG_RETURN_NULL();
-    }
-
-    sockfd = socket(AF_INET, SOCK_STREAM, protoent->p_proto);
+    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd == -1) {
         PG_RETURN_NULL();
     }
@@ -140,79 +118,50 @@ Datum rpc_request(PG_FUNCTION_ARGS)
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    hostent = gethostbyname(g_hostname);
-    if (hostent == NULL) {
-        elog(ERROR, "Could not lookup host by name");
+    memset(&addr, 0, sizeof(addr));
+
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, g_path, sizeof(addr.sun_path) - 1);
+
+    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        error = strerror(errno);
+        elog(ERROR, "Could not connect: %s", error);
         PG_RETURN_NULL();
     }
-    in_addr = inet_addr(inet_ntoa(*(struct in_addr*)*(hostent->h_addr_list)));
-    if (in_addr == (in_addr_t)-1) {
-        elog(ERROR, "Could not lookup address");
-        PG_RETURN_NULL();
-    }
-    sockaddr_in.sin_addr.s_addr = in_addr;
-    sockaddr_in.sin_family = AF_INET;
-    sockaddr_in.sin_port = htons(g_port);
-
-    flags = fcntl(sockfd, F_GETFL);
-    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        elog(ERROR, "could not set socket nonblocking");
-        PG_RETURN_NULL();
-    }
-
-    FD_ZERO(&w);
-    FD_ZERO(&x);
-    FD_SET(sockfd, &w);
-    FD_SET(sockfd, &x);
-
-    if (connect(sockfd, (struct sockaddr*)&sockaddr_in, sizeof(sockaddr_in)) != -1) {
-        elog(ERROR, "not a non blocking connection");
-        PG_RETURN_NULL();
-    }
-
-    if (errno != EINPROGRESS) {
-        elog(ERROR, "not connecting");
-        PG_RETURN_NULL();
-    }
-
-    select(FD_SETSIZE, NULL, &w, &x, &timeout);
-
-    if (!FD_ISSET(sockfd, &w))
-    {
-        elog(ERROR, "connection timed out");
-        PG_RETURN_NULL();
-    }
-
-    // opts &= ~O_NONBLOCK;
-
-    if (fcntl(sockfd, F_SETFL, flags & (~O_NONBLOCK)) == -1) {
-        elog(ERROR, "could not set socket blocking");
-        PG_RETURN_NULL();
-    }
-
     if (send(sockfd, &send_netlen, sizeof(uint32_t), MSG_MORE) == -1) {
-        elog(ERROR, "Length did not send");
+        error = strerror(errno);
+        elog(ERROR, "Length did not send: %s", error);
         PG_RETURN_NULL();
     }
 
     if (sendall(sockfd, request, send_len) == -1) {
-        elog(ERROR, "Data did not send");
+        error = strerror(errno);
+        elog(ERROR, "Data did not send: %s", error);
         PG_RETURN_NULL();
     }
 
     if (shutdown(sockfd, SHUT_WR) == -1) {
-        elog(ERROR, "Could not shutdown write");
+        error = strerror(errno);
+        elog(ERROR, "Could not shutdown write: %s", error);
         PG_RETURN_NULL();
     }
 
     if (recv(sockfd, &recv_netlen, sizeof(uint32_t), 0)  == -1) {
-        elog(ERROR, "Could not read len");
+        error = strerror(errno);
+        elog(ERROR, "Could not read len: %s", error);
         PG_RETURN_NULL();
     }
 
     recv_len = ntohl(recv_netlen);
 
-    response = (char *)malloc(recv_len + 1);
+    response = malloc(recv_len + 1);
+
+    if (response == NULL) {
+        error = strerror(errno);
+        elog(ERROR, "Could not allocate memory for response: %s", error);
+        PG_RETURN_NULL();
+    }
+
     memset(response, 0, recv_len + 1);
 
     if (recvall(sockfd, response, recv_len)  == -1) {

@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
-	"io/ioutil"
 	"fmt"
 	"io"
-	"bytes"
+	"io/ioutil"
 	"log"
 	"net"
+	"os"
 )
 
 func accept(conn net.Conn) {
@@ -44,7 +45,13 @@ func accept(conn net.Conn) {
 }
 
 func main() {
-	internal, err := net.Listen("tcp", ":3003")
+	path := os.Args[1]
+
+	if err := os.RemoveAll(path); err != nil {
+		log.Fatal(err)
+	}
+
+	internal, err := net.Listen("unix", path)
 	if err != nil {
 		panic(err)
 	}
